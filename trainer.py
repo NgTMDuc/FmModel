@@ -1,11 +1,37 @@
-import torch 
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, AutoTokenizer
-from huggingface_hub import login 
-from peft import LoraConfig, get_peft_model
-from trl import SFTTrainer
-from transformers import TrainingArguments
-from preprocess_data import dataset_loader
+### IMPORT AND CONFIG THE ENV
+import pandas as pd
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
+import os
+import torch
+from time import time
+from datasets import load_dataset
+from peft import LoraConfig, PeftModel, prepare_model_for_kbit_training
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    AutoTokenizer,
+    TrainingArguments,
+)
+from huggingface_hub import login
+from trl import SFTTrainer,setup_chat_format
+from dotenv import load_dotenv
+import os
+load_dotenv()
+HF_TOKEN = os.getenv("HF_TOKEN")
+login(HF_TOKEN)
+import string
+import json
+###### 
+options = list(string.ascii_uppercase[:10])
+
+
 ### Hyper-parameter ###
+model_id = "meta-llama/Meta-Llama-3-70B-Instruct"
+cache_dir = "../cache/"
+
 lora_alpha = 16
 lora_dropout = 0.1
 lora_r = 64
@@ -25,56 +51,59 @@ lr_scheduler_type = "linear"
 max_seq_length = 2048
 ### ---------------- ###
 
-model_id = "meta-llama/Meta-Llama-3-70B-Instruct"
-
+compute_dtype = torch.bfloat16
 bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16,
-)
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=compute_dtype,
+        bnb_4bit_use_double_quant=True)
 
+time_start = time()
+
+model_config = AutoConfig.from_pretrained(
+    model_id,
+    trust_remote_code=True,
+    max_new_tokens=1024
+)
 model = AutoModelForCausalLM.from_pretrained(
-    model_id, 
+    model_id,
+    trust_remote_code=True,
+    config=model_config,
     quantization_config=bnb_config,
-    trust_remote_code=True
+    device_map='cuda',
 )
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+time_end = time()
+print(f"Prepare model, tokenizer: {round(time_end-time_start, 3)} sec.")
 
-tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-tokenizer.pad_token = tokenizer.eos_token
+model, tokenizer = setup_chat_format(model, tokenizer)
+model = prepare_model_for_kbit_training(model)
 
-peft_config = LoraConfig(
-    lora_alpha=lora_alpha,
-    lora_dropout=lora_dropout,
-    r=lora_r,
-    bias="none",
-    task_type="CAUSAL_LM"
+### PREPARE THE DATASET
+dataset = load_dataset("csv", data_files = "b6_train_data.csv")["train"]
+def format_chat_template(row):
+    message = [
+        {
+        "content": row["question"],
+        "role": "user"
+    },{
+        "content": "Can I know options to choose frome?",
+        "role": "assistant"
+    },{
+        "content": f"The options are:\n{json.loads(row['choices'])}",
+        "role": "user"
+    },
+    {
+        "content": f"Anser is {row['answer']}",
+        "role": "assistant"
+    }
+    ]
+    chat = tokenizer.apply_chat_template(message, tokenize = False)
+    return {"text": chat}
+
+processed_dataset = dataset.map(
+    format_chat_template,
+    num_proc= os.cpu_count(),
 )
-
-training_arguments = TrainingArguments(
-    output_dir=output_dir,
-    per_device_train_batch_size=per_device_train_batch_size,
-    gradient_accumulation_steps=gradient_accumulation_steps,
-    optim=optim,
-    num_train_epochs=num_train_epochs,
-    save_steps=save_steps,
-    logging_steps=logging_steps,
-    learning_rate=learning_rate,
-    fp16=True,
-    max_grad_norm=max_grad_norm,
-    max_steps=max_steps,
-    warmup_ratio=warmup_ratio,
-    group_by_length=True,
-    lr_scheduler_type=lr_scheduler_type,
-)
-dataset = dataset_loader("train")
-trainer = SFTTrainer(
-    model=model,
-    train_dataset=dataset,
-    peft_config=peft_config,
-    dataset_text_field="text",
-    max_seq_length=max_seq_length,
-    tokenizer=tokenizer,
-    args=training_arguments,
-)
-
-trainer.train()
+dataset = processed_dataset.train_test_split(test_size=0.01)
+print(processed_dataset[0])
